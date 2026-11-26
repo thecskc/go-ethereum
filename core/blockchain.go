@@ -2010,6 +2010,13 @@ func (bc *BlockChain) insertChain(ctx context.Context, chain types.Blocks, setHe
 				// finalized block.
 				log.Debug("Ignoring already known beacon block", "number", block.Number(), "hash", block.Hash())
 				stats.ignored++
+				if bc.logger != nil && bc.logger.OnSkippedBlock != nil {
+					bc.logger.OnSkippedBlock(tracing.BlockEvent{
+						Block:     block,
+						Finalized: bc.CurrentFinalBlock(),
+						Safe:      bc.CurrentSafeBlock(),
+					})
+				}
 
 				block, err = it.next()
 				continue

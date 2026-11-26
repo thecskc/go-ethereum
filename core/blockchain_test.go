@@ -41,6 +41,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/core/vm/program"
@@ -2084,8 +2085,11 @@ func TestInsertKnownHeadersWithMerging(t *testing.T) {
 // forkchoiceUpdated; otherwise a side block deleted by the freezer can reorg
 // the head below the finalized block.
 func TestInsertWithoutSetHeadKnownBlock(t *testing.T) {
-	testInsertWithoutSetHeadKnownBlock(t, rawdb.HashScheme)
-	testInsertWithoutSetHeadKnownBlock(t, rawdb.PathScheme)
+	for _, scheme := range []string{rawdb.HashScheme, rawdb.PathScheme} {
+		t.Run(scheme, func(t *testing.T) {
+			testInsertWithoutSetHeadKnownBlock(t, scheme)
+		})
+	}
 }
 
 func testInsertWithoutSetHeadKnownBlock(t *testing.T, scheme string) {
@@ -2095,6 +2099,7 @@ func testInsertWithoutSetHeadKnownBlock(t *testing.T, scheme string) {
 		BaseFee: big.NewInt(params.InitialBaseFee),
 	}
 	genDb, blocks, _ := GenerateChainWithGenesis(genesis, engine, 4, func(i int, b *BlockGen) {})
+	defer genDb.Close()
 
 	chaindb, err := rawdb.Open(rawdb.NewMemoryDatabase(), rawdb.OpenOptions{})
 	if err != nil {
@@ -2102,7 +2107,14 @@ func testInsertWithoutSetHeadKnownBlock(t *testing.T, scheme string) {
 	}
 	defer chaindb.Close()
 
-	chain, err := NewBlockChain(chaindb, genesis, engine, DefaultConfig().WithStateScheme(scheme))
+	var skipped []tracing.BlockEvent
+	config := DefaultConfig().WithStateScheme(scheme)
+	config.VmConfig.Tracer = &tracing.Hooks{
+		OnSkippedBlock: func(event tracing.BlockEvent) {
+			skipped = append(skipped, event)
+		},
+	}
+	chain, err := NewBlockChain(chaindb, genesis, engine, config)
 	if err != nil {
 		t.Fatalf("failed to create tester chain: %v", err)
 	}
@@ -2112,10 +2124,17 @@ func testInsertWithoutSetHeadKnownBlock(t *testing.T, scheme string) {
 		t.Fatalf("block %d: failed to insert into chain: %v", n, err)
 	}
 	head := chain.CurrentBlock()
+	chain.SetSafe(blocks[2].Header())
+	chain.SetFinalized(blocks[1].Header())
 
 	// Import a side chain forked from block 1 without setting the head.
-	side, _ := GenerateChain(genesis.Config, blocks[0], engine, genDb, 2, func(i int, b *BlockGen) {})
+	side, _ := GenerateChain(genesis.Config, blocks[0], engine, genDb, 2, func(i int, b *BlockGen) {
+		b.SetCoinbase(common.Address{1})
+	})
 	for _, block := range side {
+		if block.Hash() == blocks[block.NumberU64()-1].Hash() {
+			t.Fatalf("side block %d matches the canonical block", block.NumberU64())
+		}
 		if _, err := chain.InsertBlockWithoutSetHead(context.Background(), block, false); err != nil {
 			t.Fatalf("failed to insert side block %d: %v", block.NumberU64(), err)
 		}
@@ -2127,11 +2146,18 @@ func testInsertWithoutSetHeadKnownBlock(t *testing.T, scheme string) {
 	// Re-announce the side blocks, they are already known and must be skipped
 	// without reorging the head below the finalized/safe position.
 	for _, block := range side {
+		skipped = nil
 		if _, err := chain.InsertBlockWithoutSetHead(context.Background(), block, false); err != nil {
 			t.Fatalf("failed to re-announce known block %d: %v", block.NumberU64(), err)
 		}
 		if chain.CurrentBlock().Hash() != head.Hash() {
 			t.Fatalf("re-announced known block %v moved the head, have %v, want %v", block.Hash(), chain.CurrentBlock().Hash(), head.Hash())
+		}
+		if len(skipped) != 1 {
+			t.Fatalf("known side block emitted %d skip events, want 1", len(skipped))
+		}
+		if skipped[0].Block.Hash() != block.Hash() || skipped[0].Safe.Hash() != blocks[2].Hash() || skipped[0].Finalized.Hash() != blocks[1].Hash() {
+			t.Fatalf("skip event does not match the replayed block and safe/finalized headers: %+v", skipped[0])
 		}
 	}
 
