@@ -41,6 +41,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/core/vm/program"
@@ -2077,6 +2078,108 @@ func testInsertKnownChainData(t *testing.T, typ string, scheme string) {
 func TestInsertKnownHeadersWithMerging(t *testing.T) {
 	testInsertKnownChainDataWithMerging(t, "headers", 0)
 }
+
+// TestInsertWithoutSetHeadKnownBlock verifies that re-announcing a block that
+// was already imported through InsertBlockWithoutSetHead (the newPayload path)
+// never moves the chain head. The head is exclusively updated via
+// forkchoiceUpdated; otherwise a side block deleted by the freezer can reorg
+// the head below the finalized block.
+func TestInsertWithoutSetHeadKnownBlock(t *testing.T) {
+	for _, scheme := range []string{rawdb.HashScheme, rawdb.PathScheme} {
+		t.Run(scheme, func(t *testing.T) {
+			testInsertWithoutSetHeadKnownBlock(t, scheme)
+		})
+	}
+}
+
+func testInsertWithoutSetHeadKnownBlock(t *testing.T, scheme string) {
+	engine := ethash.NewFaker()
+	genesis := &Genesis{
+		Config:  params.TestChainConfig,
+		BaseFee: big.NewInt(params.InitialBaseFee),
+	}
+	genDb, blocks, _ := GenerateChainWithGenesis(genesis, engine, 4, func(i int, b *BlockGen) {})
+	defer genDb.Close()
+
+	chaindb, err := rawdb.Open(rawdb.NewMemoryDatabase(), rawdb.OpenOptions{})
+	if err != nil {
+		t.Fatalf("failed to create temp freezer db: %v", err)
+	}
+	defer chaindb.Close()
+
+	var skipped []tracing.BlockEvent
+	config := DefaultConfig().WithStateScheme(scheme)
+	config.VmConfig.Tracer = &tracing.Hooks{
+		OnSkippedBlock: func(event tracing.BlockEvent) {
+			skipped = append(skipped, event)
+		},
+	}
+	chain, err := NewBlockChain(chaindb, genesis, engine, config)
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	defer chain.Stop()
+
+	if n, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("block %d: failed to insert into chain: %v", n, err)
+	}
+	head := chain.CurrentBlock()
+	chain.SetSafe(blocks[2].Header())
+	chain.SetFinalized(blocks[1].Header())
+
+	// Import a side chain forked from block 1 without setting the head.
+	side, _ := GenerateChain(genesis.Config, blocks[0], engine, genDb, 2, func(i int, b *BlockGen) {
+		b.SetCoinbase(common.Address{1})
+	})
+	for _, block := range side {
+		if block.Hash() == blocks[block.NumberU64()-1].Hash() {
+			t.Fatalf("side block %d matches the canonical block", block.NumberU64())
+		}
+		if _, err := chain.InsertBlockWithoutSetHead(context.Background(), block, false); err != nil {
+			t.Fatalf("failed to insert side block %d: %v", block.NumberU64(), err)
+		}
+		if chain.CurrentBlock().Hash() != head.Hash() {
+			t.Fatalf("side block import moved the head")
+		}
+	}
+
+	// Re-announce the side blocks, they are already known and must be skipped
+	// without reorging the head below the finalized/safe position.
+	for _, block := range side {
+		skipped = nil
+		if _, err := chain.InsertBlockWithoutSetHead(context.Background(), block, false); err != nil {
+			t.Fatalf("failed to re-announce known block %d: %v", block.NumberU64(), err)
+		}
+		if chain.CurrentBlock().Hash() != head.Hash() {
+			t.Fatalf("re-announced known block %v moved the head, have %v, want %v", block.Hash(), chain.CurrentBlock().Hash(), head.Hash())
+		}
+		if len(skipped) != 1 {
+			t.Fatalf("known side block emitted %d skip events, want 1", len(skipped))
+		}
+		if skipped[0].Block.Hash() != block.Hash() || skipped[0].Safe.Hash() != blocks[2].Hash() || skipped[0].Finalized.Hash() != blocks[1].Hash() {
+			t.Fatalf("skip event does not match the replayed block and safe/finalized headers: %+v", skipped[0])
+		}
+	}
+
+	// Import a block extending the current head without setting the head, then
+	// re-announce it: the head must stay until forkchoiceUpdated selects it.
+	child, _ := GenerateChain(genesis.Config, blocks[len(blocks)-1], engine, genDb, 1, func(i int, b *BlockGen) {})
+	for _, block := range child {
+		if _, err := chain.InsertBlockWithoutSetHead(context.Background(), block, false); err != nil {
+			t.Fatalf("failed to insert child block %d: %v", block.NumberU64(), err)
+		}
+		if chain.CurrentBlock().Hash() != head.Hash() {
+			t.Fatalf("child block import moved the head")
+		}
+		if _, err := chain.InsertBlockWithoutSetHead(context.Background(), block, false); err != nil {
+			t.Fatalf("failed to re-announce known child block %d: %v", block.NumberU64(), err)
+		}
+		if chain.CurrentBlock().Hash() != head.Hash() {
+			t.Fatalf("re-announced known child block %v moved the head", block.Hash())
+		}
+	}
+}
+
 func TestInsertKnownReceiptChainWithMerging(t *testing.T) {
 	testInsertKnownChainDataWithMerging(t, "receipts", 0)
 }
